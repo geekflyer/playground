@@ -1,8 +1,8 @@
-use crossbeam_queue::SegQueue;
 use scraper::{Html, Selector};
 use std::time::Duration;
 use std::vec;
 use std::{collections::HashSet, sync::Arc};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
 use url::Url;
 
@@ -17,63 +17,79 @@ async fn main() -> anyhow::Result<()> {
     start_crawler(seed_urls).await?;
     Ok(())
 }
+type CrawlJobResult = anyhow::Result<Vec<String>>;
 
 async fn start_crawler(seed_urls: Vec<String>) -> anyhow::Result<()> {
     println!("Starting crawler");
 
-    let mut visited_urls: HashSet<String> = HashSet::new();
-    let crawl_task_limit_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CRAWL_TASKS));
-    let urls_to_crawl = Arc::new(SegQueue::<String>::new());
+    let mut seen_urls: HashSet<String> = HashSet::new();
+    let (crawl_job_results_tx, mut crawl_jobs_results_rx) =
+        tokio::sync::mpsc::unbounded_channel::<CrawlJobResult>();
+    let (urls_to_crawl_tx, urls_to_crawl_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    // we're using a counter to keep track of how many crawl jobs are still pending.
+    // This is used to determine when there's nothing more left to crawl, at which point we stop the process gracefully.
+    // Using this counter is a bit ugly/hacky and there's a probably a cleaner way to do this.
+    let mut pending_crawl_jobs = 0;
+
     for url in seed_urls {
-        urls_to_crawl.push(url);
+        pending_crawl_jobs += 1;
+        urls_to_crawl_tx.send(url).unwrap();
     }
 
-    loop {
-        let urls_to_crawl = Arc::clone(&urls_to_crawl);
+    tokio::spawn(async move {
+        start_dispatcher(urls_to_crawl_rx, crawl_job_results_tx)
+            .await
+            .unwrap();
+    });
 
-        match urls_to_crawl.pop() {
-            None => {
-                // instead of keeping track of pending tasks explicitly via a Vec<JoinHandle> or similar, we use the
-                // semaphore to check to indirectly there are still pending tasks.
-                // This mainly to avoid an ever-growing Vec<JoinHandle>, which would consume a good amoutn of increasing memory.
-                // There might be better / more idiomatic ways to do this, but appears to work well enough, without consuming too much memory.
-                if crawl_task_limit_semaphore.available_permits() == MAX_CONCURRENT_CRAWL_TASKS {
-                    // no more work to do or pending. we can exit the loop (and program) here.
-                    break;
-                } else {
-                    // currently no more new urls, but there are still pending tasks, so let's poll the queue again after a short sleep.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
+    while let Some(crawl_job_result) = crawl_jobs_results_rx.recv().await {
+        pending_crawl_jobs -= 1;
+
+        if let CrawlJobResult::Ok(urls_found) = &crawl_job_result {
+            for url in urls_found {
+                if seen_urls.insert(url.clone()) {
+                    // the insert returns true if the url was not already in the set, so we're only adding this to urls_to_crawl if we haven't seen it before.
+                    pending_crawl_jobs += 1;
+                    urls_to_crawl_tx.send(url.to_string()).unwrap();
                 }
             }
-            Some(url) => {
-                if !visited_urls.insert(url.clone()) {
-                    // we've already visited this url, so we can skip it.
-                    continue;
-                }
-                let permit = Arc::clone(&crawl_task_limit_semaphore)
-                    .acquire_owned()
-                    .await;
-                tokio::spawn(async move {
-                    match crawl(url.clone()).await {
-                        Ok(urls_found) => {
-                            for url in urls_found {
-                                urls_to_crawl.push(url);
-                            }
-                        }
-                        Err(e) => {
-                            println!("Error crawling url: {} ,error: {}", url, e);
-                        }
-                    }
-                    drop(permit);
-                });
-            }
+        }
+
+        if pending_crawl_jobs == 0 {
+            break;
         }
     }
 
-    println!("Crawler finished. Crawled {} urls", visited_urls.len());
+    println!("Crawler finished. Crawled {} urls", seen_urls.len());
 
     return Ok(());
+}
+
+async fn start_dispatcher(
+    mut urls_to_crawl_rx: UnboundedReceiver<String>,
+    crawl_results_tx: UnboundedSender<CrawlJobResult>,
+) -> anyhow::Result<()> {
+    let crawl_task_limit_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CRAWL_TASKS));
+
+    while let Some(url) = urls_to_crawl_rx.recv().await {
+        let tx = crawl_results_tx.clone();
+        let permit = crawl_task_limit_semaphore.clone().acquire_owned().await;
+        tokio::spawn(async move {
+            match crawl(url.clone()).await {
+                Ok(urls_found) => {
+                    tx.send(CrawlJobResult::Ok(urls_found)).unwrap();
+                }
+                Err(e) => {
+                    println!("Error crawling url: {} ,error: {}", url, e);
+                    tx.send(CrawlJobResult::Err(e)).unwrap();
+                }
+            }
+            drop(permit)
+        });
+    }
+
+    Ok(())
 }
 
 async fn crawl(url: String) -> anyhow::Result<Vec<String>> {

@@ -1,7 +1,7 @@
 # christians rust code
 
-### Run
+### Run crawler
 
 ```
-cargo run
+cargo run -- "https://axiom.co"
 ```
